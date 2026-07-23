@@ -1,4 +1,5 @@
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -19,11 +20,30 @@ logging.getLogger("pdfplumber").setLevel(logging.ERROR)
 
 _GS = shutil.which("gs")
 
+# File types MarkItDown can convert. Discovery in a folder is limited to these;
+# a single-file argument is checked against this set before conversion.
+SUPPORTED_EXTENSIONS = {
+    ".pdf",
+    ".docx", ".pptx", ".xlsx", ".xls",
+    ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
+    ".mp3", ".wav", ".m4a", ".flac",
+    ".html", ".htm",
+    ".csv", ".json", ".xml",
+    ".zip", ".epub", ".msg",
+}
 
-def _extract(pdf: Path) -> str:
-    """Run MarkItDown on a PDF and return its text content."""
+# Formats where empty output most likely means "no text layer / OCR needed"
+# rather than a genuinely empty or broken file. (Audio that transcribes to
+# nothing, or an empty spreadsheet, is a failure — not an OCR candidate.)
+_OCR_CANDIDATE_EXTENSIONS = {
+    ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
+}
+
+
+def _extract(src) -> str:
+    """Run MarkItDown on a file path or URL and return its text content."""
     md = MarkItDown()
-    return md.convert(str(pdf)).text_content
+    return md.convert(str(src)).text_content
 
 
 _SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
@@ -108,35 +128,37 @@ def _normalize_with_ghostscript(pdf: Path) -> Path | None:
     return cleaned if cleaned.exists() and cleaned.stat().st_size > 0 else None
 
 
-def convert_pdf(pdf: Path, output_dir: Path, label: str | None = None) -> str:
-    """Convert a single PDF to Markdown.
+def convert_file(src: Path, out_file: Path, label: str | None = None) -> str:
+    """Convert a single supported file to Markdown, writing to ``out_file``.
 
     Returns one of:
-      - ``"converted"`` — text extracted and written to ``output_dir``.
-      - ``"scanned"``   — the PDF opened fine but has no text layer (image-only
-                          / scanned); it needs OCR, which this tool does not do.
-      - ``"failed"``    — the PDF could not be read at all (corrupt/unsupported).
+      - ``"converted"`` — text extracted and written to ``out_file``.
+      - ``"scanned"``   — a PDF/image that opened fine but yielded no text
+                          (image-only / scanned); it needs OCR, which this tool
+                          does not do.
+      - ``"failed"``    — the file could not be read, or produced no text and is
+                          not an OCR candidate.
 
     ``label`` is the name shown in the live progress line (defaults to the
     file name); pass e.g. ``"[3/25] chapter.pdf"`` for batch position.
     """
-    output_dir.mkdir(parents=True, exist_ok=True)
-    output_file = output_dir / (pdf.stem + ".md")
-    label = label or pdf.name
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+    label = label or src.name
+    ext = src.suffix.lower()
 
     text = ""
     elapsed = 0.0
     extraction_errored = False
     try:
-        text, elapsed = _run_with_progress(lambda: _extract(pdf), label)
+        text, elapsed = _run_with_progress(lambda: _extract(src), label)
     except Exception as exc:  # noqa: BLE001 — keep a batch alive on any single bad file
         extraction_errored = True
-        print(f"  ! Direct conversion failed for {pdf.name}: {exc}")
+        print(f"  ! Conversion failed for {src.name}: {exc}")
 
-    # If extraction errored or produced effectively nothing, retry on a
-    # Ghostscript-normalized copy that flattens problematic colour spaces.
-    if not text.strip():
-        cleaned = _normalize_with_ghostscript(pdf)
+    # PDF-only: retry on a Ghostscript-normalized copy that flattens problematic
+    # colour spaces, which sometimes unblocks text extraction.
+    if not text.strip() and ext == ".pdf":
+        cleaned = _normalize_with_ghostscript(src)
         if cleaned is not None:
             try:
                 text, retry_elapsed = _run_with_progress(
@@ -146,81 +168,130 @@ def convert_pdf(pdf: Path, output_dir: Path, label: str | None = None) -> str:
                 extraction_errored = False  # retry read the file successfully
             except Exception as exc:  # noqa: BLE001
                 extraction_errored = True
-                print(f"  ! Ghostscript retry failed for {pdf.name}: {exc}")
+                print(f"  ! Ghostscript retry failed for {src.name}: {exc}")
             finally:
                 shutil.rmtree(cleaned.parent, ignore_errors=True)
 
     if not text.strip():
-        # No text after every attempt. If the file opened without error it has
-        # no text layer — a scanned / image-only PDF that needs OCR (this tool
-        # extracts existing text only). If extraction errored, the file itself
-        # is unreadable.
+        # No text after every attempt.
         if extraction_errored:
-            print(f"  ✗ {label} — unreadable PDF, skipped ({elapsed:.1f}s)")
+            print(f"  ✗ {label} — could not read file, skipped ({elapsed:.1f}s)")
             return "failed"
-        print(
-            f"  ⚠ {label} — no text layer (likely scanned/image-only); "
-            f"needs OCR, skipped ({elapsed:.1f}s)"
-        )
-        return "scanned"
+        if ext in _OCR_CANDIDATE_EXTENSIONS:
+            # Opened fine but no text layer → scanned / image-only; needs OCR.
+            print(
+                f"  ⚠ {label} — no text layer (likely scanned/image-only); "
+                f"needs OCR, skipped ({elapsed:.1f}s)"
+            )
+            return "scanned"
+        print(f"  ✗ {label} — no text extracted, skipped ({elapsed:.1f}s)")
+        return "failed"
 
-    output_file.write_text(text, encoding="utf-8")
-    print(f"  ✓ {label} → {output_file}  ({elapsed:.1f}s)")
+    out_file.write_text(text, encoding="utf-8")
+    print(f"  ✓ {label} → {out_file}  ({elapsed:.1f}s)")
     return "converted"
 
 
-def convert_folder(folder_path: str) -> None:
-    folder = Path(folder_path).expanduser().resolve()
+def _looks_like_url(s: str) -> bool:
+    return s.startswith(("http://", "https://"))
 
-    if not folder.exists():
-        print(f"Error: path not found — {folder}")
+
+def convert_url(url: str) -> None:
+    """Convert a URL (e.g. a YouTube video or web page) to Markdown.
+
+    Writes to ``./markdown/<slug>.md`` under the current directory, since a URL
+    has no source folder to mirror.
+    """
+    output_dir = Path.cwd() / "markdown"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", url.split("://", 1)[-1]).strip("_")[:80]
+    out_file = output_dir / ((slug or "url") + ".md")
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        text, elapsed = _run_with_progress(lambda: _extract(url), url)
+    except Exception as exc:  # noqa: BLE001
+        print(f"  ✗ {url} — conversion failed: {exc}")
         sys.exit(1)
 
-    if folder.is_file():
-        if folder.suffix.lower() != ".pdf":
-            print(f"Error: expected a .pdf file, got '{folder.suffix}'")
+    if not text.strip():
+        print(f"  ✗ {url} — no content extracted (no captions/transcript?)")
+        sys.exit(1)
+
+    out_file.write_text(text, encoding="utf-8")
+    print(f"  ✓ {url} → {out_file}  ({elapsed:.1f}s)")
+
+
+def convert_path(input_path: str) -> None:
+    if _looks_like_url(input_path):
+        convert_url(input_path)
+        return
+
+    target = Path(input_path).expanduser().resolve()
+
+    if not target.exists():
+        print(f"Error: path not found — {target}")
+        sys.exit(1)
+
+    if target.is_file():
+        ext = target.suffix.lower()
+        if ext not in SUPPORTED_EXTENSIONS:
+            print(
+                f"Error: unsupported file type '{target.suffix}'. Supported: "
+                f"{', '.join(sorted(SUPPORTED_EXTENSIONS))}"
+            )
             sys.exit(1)
-        output_dir = folder.parent / "markdown"
-        status = convert_pdf(folder, output_dir)
+        out_file = target.parent / "markdown" / (target.stem + ".md")
+        status = convert_file(target, out_file)
         sys.exit(0 if status == "converted" else 1)
 
-    output_root = folder / "markdown"
+    output_root = target / "markdown"
 
     # Recurse into nested folders, but never descend into our own output tree.
-    pdfs = sorted(
-        pdf
-        for pdf in folder.rglob("*.pdf")
-        if output_root not in pdf.parents
+    files = sorted(
+        f
+        for f in target.rglob("*")
+        if f.is_file()
+        and f.suffix.lower() in SUPPORTED_EXTENSIONS
+        and output_root not in f.parents
     )
-    if not pdfs:
-        print(f"No PDF files found in {folder}")
+    if not files:
+        print(f"No supported files found in {target}")
         sys.exit(1)
 
     pending = []
     skipped = 0
-    for pdf in pdfs:
+    claimed: dict[Path, Path] = {}  # output path -> source, to catch stem clashes
+    for f in files:
         # Mirror the source folder structure under the output root.
-        out_dir = output_root / pdf.parent.relative_to(folder)
-        if (out_dir / (pdf.stem + ".md")).exists():
+        out_dir = output_root / f.parent.relative_to(target)
+        out_file = out_dir / (f.stem + ".md")
+        if out_file in claimed:
+            # Another file in the same folder already claims <stem>.md (e.g.
+            # report.pdf vs report.docx). Keep the source extension so neither
+            # output silently overwrites the other: report.docx -> report_docx.md
+            out_file = out_dir / (f.stem + "_" + f.suffix.lower().lstrip(".") + ".md")
+        claimed[out_file] = f
+
+        if out_file.exists():
             skipped += 1
         else:
-            pending.append((pdf, out_dir))
+            pending.append((f, out_file))
 
     if skipped:
-        print(f"Skipping {skipped} already-converted PDF(s).")
+        print(f"Skipping {skipped} already-converted file(s).")
     if not pending:
-        print("All PDFs already converted.")
+        print("All files already converted.")
         return
 
     total = len(pending)
-    print(f"Converting {total} PDF(s) → {output_root}")
+    print(f"Converting {total} file(s) → {output_root}")
     succeeded = 0
     failed = []
     scanned = []
-    for i, (pdf, out_dir) in enumerate(pending, start=1):
-        rel = pdf.relative_to(folder)
+    for i, (f, out_file) in enumerate(pending, start=1):
+        rel = f.relative_to(target)
         label = f"[{i}/{total}] {rel}"
-        status = convert_pdf(pdf, out_dir, label=label)
+        status = convert_file(f, out_file, label=label)
         if status == "converted":
             succeeded += 1
         elif status == "scanned":
@@ -247,8 +318,8 @@ def main():
     if len(sys.argv) > 1:
         path = " ".join(sys.argv[1:]).strip().strip("'\"")
     else:
-        path = input("Enter PDF file or folder path: ").strip().strip("'\"")
-    convert_folder(path)
+        path = input("Enter a file, folder, or URL: ").strip().strip("'\"")
+    convert_path(path)
 
 
 if __name__ == "__main__":

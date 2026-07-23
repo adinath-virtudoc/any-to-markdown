@@ -1,8 +1,8 @@
-# pdf-to-markdown
+# any-to-markdown
 
 A single-file CLI that converts documents — a single file, a whole folder tree, or a URL — to Markdown.
 
-Despite the name, it now handles **every format [`markitdown`](https://github.com/microsoft/markitdown) supports**, not just PDF. It's a thin, batch-friendly wrapper around Microsoft's `markitdown` (which does the actual extraction, backed by `pdfminer.six` for PDFs). On top of that, this tool adds:
+It handles **every format [`markitdown`](https://github.com/microsoft/markitdown) supports** — PDF, Office documents, images, audio, web and data files, and URLs. It's a thin, batch-friendly wrapper around Microsoft's `markitdown` (which does the actual extraction, backed by `pdfminer.six` for PDFs). On top of that, this tool adds:
 
 - **Batch + recursion** — point it at a folder and it converts every supported file under it, mirroring the source subfolder structure into an output tree.
 - **Idempotent re-runs** — files whose `.md` already exists are skipped, so re-running a large folder only picks up what's new.
@@ -40,16 +40,16 @@ brew install ghostscript   # macOS
 
 ```bash
 # Single file → writes <parent>/markdown/<name>.md
-python pdf_to_markdown.py path/to/slides.pptx
+python any_to_markdown.py path/to/slides.pptx
 
 # Folder → recurses all supported files, writes to <folder>/markdown/... mirroring subfolders
-python pdf_to_markdown.py path/to/folder
+python any_to_markdown.py path/to/folder
 
 # URL (e.g. YouTube) → writes to ./markdown/<slug>.md
-python pdf_to_markdown.py "https://www.youtube.com/watch?v=..."
+python any_to_markdown.py "https://www.youtube.com/watch?v=..."
 
 # No args → prompts interactively for a file, folder, or URL
-python pdf_to_markdown.py
+python any_to_markdown.py
 ```
 
 ### Output layout

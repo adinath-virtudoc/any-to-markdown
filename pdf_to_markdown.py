@@ -108,8 +108,14 @@ def _normalize_with_ghostscript(pdf: Path) -> Path | None:
     return cleaned if cleaned.exists() and cleaned.stat().st_size > 0 else None
 
 
-def convert_pdf(pdf: Path, output_dir: Path, label: str | None = None) -> bool:
-    """Convert a single PDF to Markdown. Returns True on success, False otherwise.
+def convert_pdf(pdf: Path, output_dir: Path, label: str | None = None) -> str:
+    """Convert a single PDF to Markdown.
+
+    Returns one of:
+      - ``"converted"`` — text extracted and written to ``output_dir``.
+      - ``"scanned"``   — the PDF opened fine but has no text layer (image-only
+                          / scanned); it needs OCR, which this tool does not do.
+      - ``"failed"``    — the PDF could not be read at all (corrupt/unsupported).
 
     ``label`` is the name shown in the live progress line (defaults to the
     file name); pass e.g. ``"[3/25] chapter.pdf"`` for batch position.
@@ -120,9 +126,11 @@ def convert_pdf(pdf: Path, output_dir: Path, label: str | None = None) -> bool:
 
     text = ""
     elapsed = 0.0
+    extraction_errored = False
     try:
         text, elapsed = _run_with_progress(lambda: _extract(pdf), label)
     except Exception as exc:  # noqa: BLE001 — keep a batch alive on any single bad file
+        extraction_errored = True
         print(f"  ! Direct conversion failed for {pdf.name}: {exc}")
 
     # If extraction errored or produced effectively nothing, retry on a
@@ -135,18 +143,30 @@ def convert_pdf(pdf: Path, output_dir: Path, label: str | None = None) -> bool:
                     lambda: _extract(cleaned), f"{label} (ghostscript retry)"
                 )
                 elapsed += retry_elapsed
+                extraction_errored = False  # retry read the file successfully
             except Exception as exc:  # noqa: BLE001
+                extraction_errored = True
                 print(f"  ! Ghostscript retry failed for {pdf.name}: {exc}")
             finally:
                 shutil.rmtree(cleaned.parent, ignore_errors=True)
 
     if not text.strip():
-        print(f"  ✗ {label} — no text extracted, skipped ({elapsed:.1f}s)")
-        return False
+        # No text after every attempt. If the file opened without error it has
+        # no text layer — a scanned / image-only PDF that needs OCR (this tool
+        # extracts existing text only). If extraction errored, the file itself
+        # is unreadable.
+        if extraction_errored:
+            print(f"  ✗ {label} — unreadable PDF, skipped ({elapsed:.1f}s)")
+            return "failed"
+        print(
+            f"  ⚠ {label} — no text layer (likely scanned/image-only); "
+            f"needs OCR, skipped ({elapsed:.1f}s)"
+        )
+        return "scanned"
 
     output_file.write_text(text, encoding="utf-8")
     print(f"  ✓ {label} → {output_file}  ({elapsed:.1f}s)")
-    return True
+    return "converted"
 
 
 def convert_folder(folder_path: str) -> None:
@@ -161,8 +181,8 @@ def convert_folder(folder_path: str) -> None:
             print(f"Error: expected a .pdf file, got '{folder.suffix}'")
             sys.exit(1)
         output_dir = folder.parent / "markdown"
-        ok = convert_pdf(folder, output_dir)
-        sys.exit(0 if ok else 1)
+        status = convert_pdf(folder, output_dir)
+        sys.exit(0 if status == "converted" else 1)
 
     output_root = folder / "markdown"
 
@@ -196,15 +216,27 @@ def convert_folder(folder_path: str) -> None:
     print(f"Converting {total} PDF(s) → {output_root}")
     succeeded = 0
     failed = []
+    scanned = []
     for i, (pdf, out_dir) in enumerate(pending, start=1):
         rel = pdf.relative_to(folder)
         label = f"[{i}/{total}] {rel}"
-        if convert_pdf(pdf, out_dir, label=label):
+        status = convert_pdf(pdf, out_dir, label=label)
+        if status == "converted":
             succeeded += 1
+        elif status == "scanned":
+            scanned.append(str(rel))
         else:
             failed.append(str(rel))
 
-    print(f"\nDone: {succeeded} converted, {len(failed)} failed.")
+    print(
+        f"\nDone: {succeeded} converted, {len(scanned)} need OCR, "
+        f"{len(failed)} failed."
+    )
+    if scanned:
+        print("Likely scanned/image-only (need OCR — e.g. markitdown-ocr "
+              "or Azure Document Intelligence):")
+        for name in scanned:
+            print(f"  - {name}")
     if failed:
         print("Failed files:")
         for name in failed:

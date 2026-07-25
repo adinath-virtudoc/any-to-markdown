@@ -6,9 +6,15 @@ import sys
 import tempfile
 import threading
 import time
+import pytesseract
 from pathlib import Path
+from pdf2image import convert_from_path
 
 from markitdown import MarkItDown
+# MarkItDown uses pytesseract for OCR on image-only PDFs, so we need to point it to the Tesseract executable. The user must have Tesseract installed and available at this path for OCR to work.
+#pytesseract.pytesseract.tesseract_cmd = (
+    #r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+#)(system specific hardcoded path,uncomment and modify as needed)
 
 # pdfminer.six (used by MarkItDown for PDFs) logs noisy, non-fatal warnings such as
 #   "Cannot set non-stroke color: 2 components specified, but only 1 (grayscale),
@@ -36,7 +42,7 @@ SUPPORTED_EXTENSIONS = {
 # rather than a genuinely empty or broken file. (Audio that transcribes to
 # nothing, or an empty spreadsheet, is a failure — not an OCR candidate.)
 _OCR_CANDIDATE_EXTENSIONS = {
-    ".pdf", ".jpg", ".jpeg", ".png", ".gif", ".bmp", ".tiff", ".tif", ".webp",
+    ".pdf", ".jpg", ".jpeg",
 }
 
 
@@ -127,6 +133,22 @@ def _normalize_with_ghostscript(pdf: Path) -> Path | None:
 
     return cleaned if cleaned.exists() and cleaned.stat().st_size > 0 else None
 
+def _extract_with_ocr(src: Path) -> str:
+    """Extract text from JPG, JPEG, or PDF using Tesseract OCR."""
+    ext = src.suffix.lower()
+
+    if ext in {".jpg", ".jpeg"}:
+        return pytesseract.image_to_string(str(src))
+
+    if ext == ".pdf":
+        images = convert_from_path(src)
+        return "\n\n".join(
+            pytesseract.image_to_string(image)
+            for image in images
+        )
+
+    return ""
+
 
 def convert_file(src: Path, out_file: Path, label: str | None = None) -> str:
     """Convert a single supported file to Markdown, writing to ``out_file``.
@@ -178,14 +200,22 @@ def convert_file(src: Path, out_file: Path, label: str | None = None) -> str:
             print(f"  ✗ {label} — could not read file, skipped ({elapsed:.1f}s)")
             return "failed"
         if ext in _OCR_CANDIDATE_EXTENSIONS:
-            # Opened fine but no text layer → scanned / image-only; needs OCR.
-            print(
-                f"  ⚠ {label} — no text layer (likely scanned/image-only); "
-                f"needs OCR, skipped ({elapsed:.1f}s)"
-            )
-            return "scanned"
-        print(f"  ✗ {label} — no text extracted, skipped ({elapsed:.1f}s)")
-        return "failed"
+            print(f"  ⚠ {label} — no text layer, trying OCR...")
+            try:
+                ocr_text = _extract_with_ocr(src)
+
+                if ocr_text.strip():
+                    out_file.write_text(ocr_text, encoding="utf-8")
+                    print(f"  ✓ {label} → {out_file} (OCR)")
+                    return "converted"
+
+                print(f"  ✗ {label} — OCR found no text")
+                return "failed"
+
+            except Exception as exc:
+                print(f"  ✗ {label} — OCR failed: {exc}")
+                return "failed"
+        
 
     out_file.write_text(text, encoding="utf-8")
     print(f"  ✓ {label} → {out_file}  ({elapsed:.1f}s)")

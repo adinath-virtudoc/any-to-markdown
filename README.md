@@ -7,7 +7,7 @@ It handles **every format [`markitdown`](https://github.com/microsoft/markitdown
 - **Batch + recursion** — point it at a folder and it converts every supported file under it, mirroring the source subfolder structure into an output tree.
 - **Idempotent re-runs** — files whose `.md` already exists are skipped, so re-running a large folder only picks up what's new.
 - **Live progress** — a spinner + elapsed timer per file (and `[3/25]`-style batch position), with a clean fallback to plain log lines when output isn't a TTY.
-- **Scanned-PDF / image detection** — a PDF or image that opens fine but has no text layer is flagged as `needs OCR` and reported separately, rather than being lumped into "failed". (This tool extracts existing text only; it does not OCR — see [OCR](#ocr) below.)
+- **OCR fallback for scans** — a PDF or image with no text layer is passed to Tesseract locally, so scanned pages convert instead of being skipped. Needs two system binaries; without them the file is reported as `needs OCR` and skipped rather than failing. See [OCR](#ocr) below.
 - **Ghostscript fallback** (PDF only) — if a PDF's odd colour space (Separation/DeviceN/ICCBased/Lab) yields empty text, it automatically retries on a Ghostscript-normalized (RGB-flattened) copy. A single bad file never aborts the batch.
 - **Quiet output** — silences the noisy-but-harmless `pdfminer`/`pdfplumber` colour-space warnings.
 
@@ -24,17 +24,22 @@ It handles **every format [`markitdown`](https://github.com/microsoft/markitdown
 ## Install
 
 ```bash
-pip install 'markitdown[all]'
+pip install 'markitdown[all]' -r requirements.txt
 ```
 
 `[all]` pulls in every format's dependencies. To keep it lean, install only what you need — e.g. `pip install 'markitdown[pdf, docx, pptx]'`.
 
-Optional but recommended for the PDF colour-space fallback: [Ghostscript](https://www.ghostscript.com/) (`gs`) on your `PATH`.
+Two optional system binaries, both looked up on your `PATH` at startup:
 
 ```bash
-brew install ghostscript   # macOS
-# apt install ghostscript  # Debian/Ubuntu
+brew install ghostscript tesseract poppler          # macOS
+# apt install ghostscript tesseract-ocr poppler-utils   # Debian/Ubuntu
 ```
+
+- **Ghostscript** (`gs`) — the PDF colour-space fallback.
+- **Tesseract** + **Poppler** (`pdftoppm`) — [OCR](#ocr). Tesseract does the recognition; Poppler rasterizes PDF pages so there's an image to recognize. Tesseract alone is enough for image files.
+
+Each is optional: a missing binary disables only its own fallback, and the tool reports why.
 
 ## Usage
 
@@ -63,18 +68,24 @@ python any_to_markdown.py
 
 1. Route the input by extension (or treat it as a URL) and run `markitdown` on it.
 2. **PDF only:** if extraction errors or returns empty text and Ghostscript is available, re-render to a temporary RGB-flattened copy and retry.
-3. Classify the result: `converted`, `scanned` (PDF/image with no text layer — needs OCR), or `failed` (unreadable, or empty and not an OCR candidate). A batch prints a summary counting each.
+3. **PDFs and images only:** if there's still no text, OCR the file with Tesseract.
+4. Classify the result: `converted`, `scanned` (a scan needing OCR, but the OCR binaries are missing), or `failed` (unreadable, or genuinely empty). A batch prints a summary counting each.
+
+An empty result is never written out as a successful conversion — a file that yields no text is always reported as `scanned` or `failed`, so the summary count matches what's actually on disk.
 
 ## OCR
 
-This tool extracts **existing** text. It does not OCR scanned/image-only PDFs or images — those are flagged `needs OCR` and skipped. To add OCR, use one of:
+When a PDF or image yields no text, it is almost always a scan: a photograph of a page, with no text layer to extract. Those files are passed to [Tesseract](https://github.com/tesseract-ocr/tesseract), which runs locally — nothing is sent to a cloud service or an LLM. PDF pages are rasterized at 300 dpi (Tesseract's recommended input resolution) via Poppler, one page at a time, so a long PDF doesn't have to fit in memory.
 
-- [`markitdown-ocr`](https://pypi.org/project/markitdown-ocr/) — third-party plugin using an LLM vision model (needs an API key; sends content to an external LLM).
-- Azure Document Intelligence (`markitdown[az-doc-intel]`) — Microsoft's cloud OCR, runnable inside your own Azure tenant.
+OCR applies to every image extension in the table above plus `.pdf`, and it also covers formats `markitdown` can't open at all (`.tiff`, `.bmp`), since Tesseract reads those directly.
+
+Install the [two binaries](#install) to enable it. Without them, scans are reported as `needs OCR` and listed at the end of a batch, naming the missing binary.
+
+Accuracy depends on the scan: clean 300 dpi text is near-perfect, while low-resolution, skewed, or handwritten pages degrade. Spot-check output on a sample before trusting a large batch. For cloud alternatives with different tradeoffs, see [`markitdown-ocr`](https://pypi.org/project/markitdown-ocr/) (LLM vision, needs an API key) or Azure Document Intelligence (`markitdown[az-doc-intel]`).
 
 ## Credits
 
-Extraction is powered by [microsoft/markitdown](https://github.com/microsoft/markitdown). This project just wraps it with batch handling, idempotent runs, progress output, format routing, and the Ghostscript fallback.
+Extraction is powered by [microsoft/markitdown](https://github.com/microsoft/markitdown), and OCR by [tesseract-ocr](https://github.com/tesseract-ocr/tesseract) (via [`pytesseract`](https://github.com/madmaze/pytesseract) and [`pdf2image`](https://github.com/Belval/pdf2image)). This project wraps them with batch handling, idempotent runs, progress output, format routing, and the Ghostscript and OCR fallbacks.
 
 ## License
 

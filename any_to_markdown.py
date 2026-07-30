@@ -20,6 +20,13 @@ logging.getLogger("pdfplumber").setLevel(logging.ERROR)
 
 _GS = shutil.which("gs")
 
+# OCR needs two system binaries, neither installable via pip: Tesseract for the
+# recognition itself, and Poppler's pdftoppm (used by pdf2image) to rasterize PDF
+# pages. Resolved once at import so a missing binary degrades to the old
+# "needs OCR, skipped" report instead of failing per file.
+_TESSERACT = shutil.which("tesseract")
+_PDFTOPPM = shutil.which("pdftoppm")
+
 # File types MarkItDown can convert. Discovery in a folder is limited to these;
 # a single-file argument is checked against this set before conversion.
 SUPPORTED_EXTENSIONS = {
@@ -127,15 +134,46 @@ def _normalize_with_ghostscript(pdf: Path) -> Path | None:
 
     return cleaned if cleaned.exists() and cleaned.stat().st_size > 0 else None
 
+def _ocr_unavailable_reason(ext: str) -> str | None:
+    """Return why OCR can't run for ``ext``, or None if it can."""
+    if not _TESSERACT:
+        return "Tesseract not on PATH"
+    if ext == ".pdf" and not _PDFTOPPM:
+        return "Poppler (pdftoppm) not on PATH"
+    return None
+
+
+def _extract_with_ocr(src: Path) -> str:
+    """OCR an image or image-only PDF with Tesseract and return its text.
+
+    Imports pytesseract/pdf2image lazily so the tool still converts docx, html,
+    audio and friends when the OCR extras aren't installed.
+    """
+    import pytesseract  # noqa: PLC0415 — optional dependency, imported on demand
+
+    if src.suffix.lower() != ".pdf":
+        from PIL import Image  # noqa: PLC0415
+
+        with Image.open(src) as img:
+            return pytesseract.image_to_string(img)
+
+    from pdf2image import convert_from_path  # noqa: PLC0415
+
+    # 300 dpi is Tesseract's recommended input resolution (pdf2image defaults to
+    # 200). output_folder streams pages to disk instead of holding every rendered
+    # page of a long PDF in memory at once.
+    with tempfile.TemporaryDirectory(prefix="a2m_ocr_") as tmp:
+        pages = convert_from_path(src, dpi=300, output_folder=tmp)
+        return "\n\n".join(pytesseract.image_to_string(page) for page in pages)
+
 
 def convert_file(src: Path, out_file: Path, label: str | None = None) -> str:
     """Convert a single supported file to Markdown, writing to ``out_file``.
 
     Returns one of:
       - ``"converted"`` — text extracted and written to ``out_file``.
-      - ``"scanned"``   — a PDF/image that opened fine but yielded no text
-                          (image-only / scanned); it needs OCR, which this tool
-                          does not do.
+      - ``"scanned"``   — an image-only PDF/image that needs OCR, but the OCR
+                          binaries (Tesseract / Poppler) aren't installed.
       - ``"failed"``    — the file could not be read, or produced no text and is
                           not an OCR candidate.
 
@@ -173,17 +211,39 @@ def convert_file(src: Path, out_file: Path, label: str | None = None) -> str:
                 shutil.rmtree(cleaned.parent, ignore_errors=True)
 
     if not text.strip():
-        # No text after every attempt.
+        # No text after every attempt. For PDFs and images that is the expected
+        # signature of a scan, so fall back to OCR — including when MarkItDown
+        # could not open the file at all, since it has no converter for .tiff or
+        # .bmp while Tesseract reads both.
+        if ext in _OCR_CANDIDATE_EXTENSIONS:
+            unavailable = _ocr_unavailable_reason(ext)
+            if unavailable:
+                print(
+                    f"  ⚠ {label} — no text layer (likely scanned/image-only); "
+                    f"OCR unavailable ({unavailable}), skipped ({elapsed:.1f}s)"
+                )
+                return "scanned"
+
+            try:
+                ocr_text, ocr_elapsed = _run_with_progress(
+                    lambda: _extract_with_ocr(src), f"{label} (OCR)"
+                )
+                elapsed += ocr_elapsed
+            except Exception as exc:  # noqa: BLE001 — keep a batch alive
+                print(f"  ✗ {label} — OCR failed: {exc}")
+                return "failed"
+
+            if ocr_text.strip():
+                out_file.write_text(ocr_text, encoding="utf-8")
+                print(f"  ✓ {label} → {out_file}  (OCR, {elapsed:.1f}s)")
+                return "converted"
+
+            print(f"  ✗ {label} — OCR found no text, skipped ({elapsed:.1f}s)")
+            return "failed"
+
         if extraction_errored:
             print(f"  ✗ {label} — could not read file, skipped ({elapsed:.1f}s)")
             return "failed"
-        if ext in _OCR_CANDIDATE_EXTENSIONS:
-            # Opened fine but no text layer → scanned / image-only; needs OCR.
-            print(
-                f"  ⚠ {label} — no text layer (likely scanned/image-only); "
-                f"needs OCR, skipped ({elapsed:.1f}s)"
-            )
-            return "scanned"
         print(f"  ✗ {label} — no text extracted, skipped ({elapsed:.1f}s)")
         return "failed"
 
@@ -304,8 +364,8 @@ def convert_path(input_path: str) -> None:
         f"{len(failed)} failed."
     )
     if scanned:
-        print("Likely scanned/image-only (need OCR — e.g. markitdown-ocr "
-              "or Azure Document Intelligence):")
+        print("Scanned/image-only, and OCR is unavailable — install the OCR "
+              "binaries (see README) and re-run:")
         for name in scanned:
             print(f"  - {name}")
     if failed:

@@ -1,1 +1,7 @@
 markitdown
+
+# OCR fallback for scanned PDFs and images. Also needs two system binaries that
+# pip cannot install: tesseract, and poppler (for PDFs) — see README.
+pytesseract
+Pillow
+pdf2image

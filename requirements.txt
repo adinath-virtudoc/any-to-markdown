@@ -1,5 +1,11 @@
 markitdown
 
+# PDF engine: structure-aware extraction (real headings/tables, per-page OCR
+# routing) tried before markitdown for every PDF. Pure accelerator — no system
+# binary needed, and its absence just means every PDF takes the markitdown/
+# Ghostscript/whole-file-OCR ladder unchanged. See README.
+pdf-inspector
+
 # OCR fallback for scanned PDFs and images. Also needs two system binaries that
 # pip cannot install: tesseract, and poppler (for PDFs) — see README.
 pytesseract
